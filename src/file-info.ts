@@ -1,3 +1,5 @@
+import { parseFrontmatter } from './frontmatter.js';
+
 export abstract class FileInfo {
   originalFile: File;
   keys: string[] = [];
@@ -46,10 +48,43 @@ export abstract class FileInfo {
 
 export class MDFileInfo extends FileInfo {
   links: string[] = [];
+  frontmatter: Record<string, any> | null = null;
 
   constructor(file: File) {
     super(file);
     this.createKeys(this.fileNameNoExt);
+  }
+
+  /**
+   * Parses frontmatter from markdown content
+   * @param content - The markdown file content
+   */
+  async parseFrontmatterFromContent(content: string): Promise<void> {
+    const result = parseFrontmatter(content);
+    if (result.success && result.data) {
+      this.frontmatter = result.data;
+    }
+  }
+
+  /**
+   * Gets the document type from frontmatter, defaults to 'journal'
+   */
+  getDocumentType(): string {
+    return this.frontmatter?.type ?? 'journal';
+  }
+
+  /**
+   * Gets the document name from frontmatter or uses the file name
+   */
+  getDocumentName(): string {
+    return this.frontmatter?.name ?? this.fileNameNoExt;
+  }
+
+  /**
+   * Gets the target folder from frontmatter, if specified
+   */
+  getTargetFolder(): string | null {
+    return this.frontmatter?.folder ?? null;
   }
 
   getLinkRegex(): RegExp[] {
