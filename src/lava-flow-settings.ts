@@ -18,4 +18,8 @@ export class LavaFlowSettings {
   combineNotes = false;
   combineNotesNoSubfolders = true;
   useTinyMCE = false;
+
+  // Frontmatter import settings
+  enableFrontmatterImport: boolean = true;
+  frontmatterDocumentTypes: string[] = ['journal', 'actor', 'item', 'scene', 'rolltable'];
 }
