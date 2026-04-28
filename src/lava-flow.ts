@@ -4,6 +4,15 @@ import { LavaFlowForm } from './lava-flow-form.js';
 import { LavaFlowSettings } from './lava-flow-settings.js';
 import { createOrGetFolder } from './util.js';
 import { JournalEntryDataConstructorData } from '@league-of-foundry-developers/foundry-vtt-types/src/foundry/common/data/data.mjs/journalEntryData';
+import { LinkConverter } from './link-converter.js';
+import {
+  DocumentFactory,
+  JournalFactory,
+  ActorFactory,
+  ItemFactory,
+  SceneFactory,
+  RollTableFactory,
+} from './document-factory.js';
 
 // eslint-disable-next-line @typescript-eslint/no-extraneous-class
 export default class LavaFlow {
@@ -68,6 +77,9 @@ export default class LavaFlow {
 
       if (settings.vaultFiles == null) return;
 
+      // Clear the link converter cache for a fresh import
+      LinkConverter.clearCache();
+
       if (settings.importNonMarkdown) {
         await LavaFlow.validateUploadLocation(settings);
       }
@@ -79,11 +91,8 @@ export default class LavaFlow {
 
       const importedFiles: FileInfo[] = rootFolder.getFilesRecursive();
 
-      const allJournals = importedFiles
-        .filter((f) => f.journalPage !== null)
-        // @ts-expect-error
-        .map((f) => f.journalPage) as JournalEntryPage[];
-      for (let i = 0; i < importedFiles.length; i++) await LavaFlow.updateLinks(importedFiles[i], allJournals);
+      // Process links for all documents
+      await LavaFlow.updateAllDocumentLinks(importedFiles);
 
       if (settings.createIndexFile || settings.createBacklinks) {
         const mdFiles = importedFiles.filter((f) => f instanceof MDFileInfo) as MDFileInfo[];
@@ -93,14 +102,19 @@ export default class LavaFlow {
       }
 
       // Update to HTML after we have done all our MD edits
-      if(settings.useTinyMCE)
+      if (settings.useTinyMCE) {
+        const allJournals = importedFiles
+          .filter((f) => f.journalPage !== null)
+          // @ts-expect-error
+          .map((f) => f.journalPage) as JournalEntryPage[];
         await LavaFlow.ConvertAllToHTML(allJournals);
+      }
 
       LavaFlow.log('Import complete.', true);
     } catch (e: any) {
       LavaFlow.errorHandling(e);
     }
-  }  
+  }
 
   static createFolderStructure(fileList: FileList): FolderInfo {
     // let previousDirectories: string[] = [];
@@ -180,14 +194,69 @@ export default class LavaFlow {
     }
   }
 
+  /**
+   * Import markdown file with frontmatter support
+   * Routes to appropriate document type based on frontmatter
+   */
   static async importMarkdownFile(
     file: MDFileInfo,
     settings: LavaFlowSettings,
     parentFolder: Folder | null,
     parentJournal: JournalEntry | null,
   ): Promise<void> {
-    const pageName = file.fileNameNoExt;
-    const journalName = parentJournal?.name ?? pageName;
+    const fileContent = await LavaFlow.getFileContent(file);
+
+    // Parse frontmatter if enabled
+    if (settings.enableFrontmatterImport) {
+      await file.parseFrontmatterFromContent(fileContent);
+    }
+
+    const documentType = file.getDocumentType();
+    const documentName = file.getDocumentName();
+
+    // Check if document type is whitelisted
+    if (settings.enableFrontmatterImport && !settings.frontmatterDocumentTypes.includes(documentType)) {
+      LavaFlow.log(
+        `Document type '${documentType}' not whitelisted. Defaulting to journal for ${file.fileNameNoExt}`,
+        false,
+      );
+      await LavaFlow.importJournalDocument(file, fileContent, documentName, parentFolder, parentJournal, settings);
+      return;
+    }
+
+    // Route to appropriate import method based on type
+    switch (documentType) {
+      case 'actor':
+        await LavaFlow.importActorDocument(file, fileContent, documentName, parentFolder, settings);
+        break;
+      case 'item':
+        await LavaFlow.importItemDocument(file, fileContent, documentName, parentFolder, settings);
+        break;
+      case 'scene':
+        await LavaFlow.importSceneDocument(file, fileContent, documentName, parentFolder, settings);
+        break;
+      case 'rolltable':
+        await LavaFlow.importRollTableDocument(file, fileContent, documentName, parentFolder, settings);
+        break;
+      case 'journal':
+      default:
+        await LavaFlow.importJournalDocument(file, fileContent, documentName, parentFolder, parentJournal, settings);
+        break;
+    }
+  }
+
+  /**
+   * Import markdown as a Journal document
+   */
+  static async importJournalDocument(
+    file: MDFileInfo,
+    content: string,
+    name: string,
+    parentFolder: Folder | null,
+    parentJournal: JournalEntry | null,
+    settings: LavaFlowSettings,
+  ): Promise<void> {
+    const journalName = parentJournal?.name ?? name;
     const journal: JournalEntry =
       parentJournal ??
       ((game as Game).journal?.find(
@@ -195,16 +264,131 @@ export default class LavaFlow {
       ) as JournalEntry) ??
       (await LavaFlow.createJournal(journalName, parentFolder, settings.playerObserve));
 
-    const fileContent = await LavaFlow.getFileContent(file);
-
     // @ts-expect-error
-    let journalPage: JournalEntryPage = journal.pages.find((p: JournalEntryPage) => p.name === pageName) ?? null;
+    let journalPage: JournalEntryPage = journal.pages.find((p: JournalEntryPage) => p.name === name) ?? null;
 
-    if (journalPage !== null && settings.overwrite) await LavaFlow.updateJournalPage(journalPage, fileContent);
+    if (journalPage !== null && settings.overwrite) await LavaFlow.updateJournalPage(journalPage, content);
     else if (journalPage === null || (!settings.overwrite && !settings.ignoreDuplicate))
-      journalPage = await LavaFlow.createJournalPage(pageName, fileContent, journal);
+      journalPage = await LavaFlow.createJournalPage(name, content, journal);
 
     file.journalPage = journalPage;
+
+    // Register in link converter
+    if (journalPage && journal.id) {
+      LinkConverter.registerDocument(file.fileNameNoExt, journal.id, 'journal', journalPage.uuid);
+    }
+  }
+
+  /**
+   * Import markdown as an Actor document
+   */
+  static async importActorDocument(
+    file: MDFileInfo,
+    content: string,
+    name: string,
+    parentFolder: Folder | null,
+    settings: LavaFlowSettings,
+  ): Promise<void> {
+    const factory = new ActorFactory();
+
+    const actor = await factory.create({
+      name,
+      content,
+      parentFolder,
+      frontmatter: file.frontmatter,
+      playerObserve: settings.playerObserve,
+    });
+
+    // Register in link converter
+    if (actor && actor.id) {
+      LinkConverter.registerDocument(file.fileNameNoExt, actor.id, 'actor', actor.uuid);
+    }
+
+    LavaFlow.log(`Imported Actor: ${name}`, false);
+  }
+
+  /**
+   * Import markdown as an Item document
+   */
+  static async importItemDocument(
+    file: MDFileInfo,
+    content: string,
+    name: string,
+    parentFolder: Folder | null,
+    settings: LavaFlowSettings,
+  ): Promise<void> {
+    const factory = new ItemFactory();
+
+    const item = await factory.create({
+      name,
+      content,
+      parentFolder,
+      frontmatter: file.frontmatter,
+      playerObserve: settings.playerObserve,
+    });
+
+    // Register in link converter
+    if (item && item.id) {
+      LinkConverter.registerDocument(file.fileNameNoExt, item.id, 'item', item.uuid);
+    }
+
+    LavaFlow.log(`Imported Item: ${name}`, false);
+  }
+
+  /**
+   * Import markdown as a Scene document
+   */
+  static async importSceneDocument(
+    file: MDFileInfo,
+    content: string,
+    name: string,
+    parentFolder: Folder | null,
+    settings: LavaFlowSettings,
+  ): Promise<void> {
+    const factory = new SceneFactory();
+
+    const scene = await factory.create({
+      name,
+      content,
+      parentFolder,
+      frontmatter: file.frontmatter,
+      playerObserve: settings.playerObserve,
+    });
+
+    // Register in link converter
+    if (scene && scene.id) {
+      LinkConverter.registerDocument(file.fileNameNoExt, scene.id, 'scene', scene.uuid);
+    }
+
+    LavaFlow.log(`Imported Scene: ${name}`, false);
+  }
+
+  /**
+   * Import markdown as a RollTable document
+   */
+  static async importRollTableDocument(
+    file: MDFileInfo,
+    content: string,
+    name: string,
+    parentFolder: Folder | null,
+    settings: LavaFlowSettings,
+  ): Promise<void> {
+    const factory = new RollTableFactory();
+
+    const table = await factory.create({
+      name,
+      content,
+      parentFolder,
+      frontmatter: file.frontmatter,
+      playerObserve: settings.playerObserve,
+    });
+
+    // Register in link converter
+    if (table && table.id) {
+      LinkConverter.registerDocument(file.fileNameNoExt, table.id, 'rolltable', table.uuid);
+    }
+
+    LavaFlow.log(`Imported RollTable: ${name}`, false);
   }
 
   static async importOtherFile(file: OtherFileInfo, settings: LavaFlowSettings): Promise<void> {
@@ -282,6 +466,22 @@ export default class LavaFlow {
     }
   }
 
+  /**
+   * Update links for all imported documents using the LinkConverter
+   */
+  static async updateAllDocumentLinks(importedFiles: FileInfo[]): Promise<void> {
+    // Get all journal pages for backward compatibility
+    const allJournals = importedFiles
+      .filter((f) => f.journalPage !== null)
+      // @ts-expect-error
+      .map((f) => f.journalPage) as JournalEntryPage[];
+
+    // Update links in journal pages using original method for backward compatibility
+    for (let i = 0; i < importedFiles.length; i++) {
+      await LavaFlow.updateLinks(importedFiles[i], allJournals);
+    }
+  }
+
   static linkMatch(fileInfo: FileInfo, matchFileInfo: FileInfo): boolean {
     if (matchFileInfo !== fileInfo && matchFileInfo instanceof MDFileInfo) {
       const linkPatterns = fileInfo.getLinkRegex();
@@ -307,8 +507,8 @@ export default class LavaFlow {
       name: journalName,
       folder: parentFolder?.id,
       // @ts-expect-error
-      ...(playerObserve && {ownership:{default: CONST.DOCUMENT_OWNERSHIP_LEVELS.OBSERVER}})
-    };   
+      ...(playerObserve && { ownership: { default: CONST.DOCUMENT_OWNERSHIP_LEVELS.OBSERVER } }),
+    };
 
     const entry = (await JournalEntry.create(entryData)) ?? new JournalEntry();
     await entry.setFlag(LavaFlow.FLAGS.SCOPE, LavaFlow.FLAGS.JOURNAL, true);
@@ -329,12 +529,12 @@ export default class LavaFlow {
       },
       { parent: journalEntry },
     );
-    await page.setFlag("core","sheetClass","core.MarkdownJournalPageSheet");
+    await page.setFlag('core', 'sheetClass', 'core.MarkdownJournalPageSheet');
     return page;
   }
 
   // @ts-expect-error
-  static async updateJournalPage(page: JournalEntryPage, content: string, ): Promise<void> {
+  static async updateJournalPage(page: JournalEntryPage, content: string): Promise<void> {
     if (page === undefined || page === null) return;
     await page.update({ text: { markdown: content } });
   }
@@ -385,15 +585,15 @@ export default class LavaFlow {
     const promises = allJournals.map((j) => LavaFlow.ConvertToHTML(j));
     await Promise.all(promises);
   }
-  
+
   // @ts-expect-error
-  static async ConvertToHTML(page: JournalEntryPage){
+  static async ConvertToHTML(page: JournalEntryPage) {
     await Promise.all([
       page.update({
         // @ts-expect-error
-        text: { markdown: "", format: CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML },
+        text: { markdown: '', format: CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML },
       }),
-      page.setFlag("core","sheetClass","core.JournalTextTinyMCESheet")
-    ])
+      page.setFlag('core', 'sheetClass', 'core.JournalTextTinyMCESheet'),
+    ]);
   }
 }
